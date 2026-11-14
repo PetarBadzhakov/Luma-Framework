@@ -5,6 +5,8 @@
 // splits the post processing command list right before the game's bloom and runs on the immediate context between its two halves (like
 // Persona 5 Royal at FXAA): bloom, lens flare, DoF, motion blur, the LUT and the tonemap run on its output, and FXAA is skipped.
 // The game quits at startup under ReShade's D3D11 wrapper unless its device check is answered for it ("InstallDeviceCheckFix()").
+// The game only draws its velocity passes with Motion Blur on and Post-Processing High or higher, so while SR runs Luma asks for them
+// itself ("InstallVelocityGateHook()").
 // Development builds can also skip FXAA, jitter without SR and flip the SR inputs (MCP "luma_dev_values" or the dev settings).
 
 #define GAME_METAL_GEAR_SOLID_V 1
@@ -24,6 +26,7 @@
 #include "..\..\Core\hooks\Hooks.h"
 
 #include <chrono>
+#include <functional>
 #include <intrin.h>
 #include <Psapi.h>
 
@@ -49,8 +52,12 @@ namespace
    // The game records its passes on deferred contexts, from several threads
    std::atomic<uint32_t> g_fxaa_draws = 0;
    std::atomic<uint32_t> g_velocity_draws = 0;
+   std::atomic<uint32_t> g_motion_blur_draws = 0;
    uint32_t g_fxaa_draws_last_frame = 0;
    uint32_t g_velocity_draws_last_frame = 0;
+   uint32_t g_motion_blur_draws_last_frame = 0;
+   // "MotionBlurMcGuire", the blur itself (twice a frame while the game draws it)
+   constexpr uint32_t kMotionBlurHash = 0xBFC7D3C2;
 
    // Outlier logger: logs every new FXAA target (view format and size) and every change of the per frame pass counts (menus,
    // cutscenes, settings changes...), so the SR code knows each case it has to handle
@@ -129,6 +136,126 @@ namespace
       }
       reshade::log::message(reshade::log::level::error, "MGSV: couldn't hook GetModuleInformation, the game quits at startup unless ReShade has its own Metal Gear Solid V fix");
    }
+
+   // SR's motion vectors come from the game's velocity passes, which it only draws when "GrPluginMotionBlur::PreExec()" asks for them:
+   // with Motion Blur on and Post-Processing High or higher. The blur itself ("Exec()") checks the same, so asking after PreExec while SR
+   // runs gives SR its motion vectors and leaves the blur to the game's settings. PreExec is found by its code (RVA 0x1E2D80 in 1.0.15.4,
+   // RIP-relative addresses masked as -1): another build doesn't match, and SR keeps those requirements.
+   // clang-format off
+   constexpr int16_t kVelocityGateCode[] = {
+      0x80, 0x79, 0x68, 0x00,                         // cmp byte ptr [rcx + 0x68], 0: the plugin's own shutter, or the camera's
+      0x49, 0x8B, 0x80, 0x70, 0x05, 0x00, 0x00,       // mov rax, [r8 + 0x570]: the view's camera
+      0xF3, 0x0F, 0x10, 0x90, 0x28, 0x01, 0x00, 0x00, // movss xmm2, [rax + 0x128]
+      0x74, 0x05,                                     // je
+      0xF3, 0x0F, 0x10, 0x51, 0x6C,                   // movss xmm2, [rcx + 0x6C]
+      0xF3, 0x0F, 0x10, 0x1D, -1, -1, -1, -1,         // movss xmm3, [minimum shutter]
+      0x0F, 0x28, 0xCA,                               // movaps xmm1, xmm2
+      0x0F, 0x57, 0xC0,                               // xorps xmm0, xmm0
+      0xF3, 0x0F, 0x5C, 0xCB,                         // subss xmm1, xmm3
+      0x0F, 0x2F, 0xC8,                               // comiss xmm1, xmm0
+      0x73, 0x03,                                     // jae
+      0x0F, 0x28, 0xD3,                               // movaps xmm2, xmm3
+      0x83, 0x3D, -1, -1, -1, -1, 0x00,               // cmp dword ptr [Motion Blur setting], 0
+      0x0F, 0x95, 0xC0,                               // setne al
+      0xA8, 0x01,                                     // test al, 1
+      0x74, 0x20,                                     // je: the setting is off, no velocity passes
+      0xF3, 0x0F, 0x10, 0x05, -1, -1, -1, -1,         // movss xmm0, [amount]
+      0xF3, 0x0F, 0x59, 0xC2,                         // mulss xmm0, xmm2
+      0x0F, 0x2F, 0x05, -1, -1, -1, -1,               // comiss xmm0, [threshold]
+      0x76, 0x0B,                                     // jbe
+      0x48, 0x8B, 0x82, 0xD0, 0x00, 0x00, 0x00,       // mov rax, [rdx + 0xD0]: the frame's pass flags
+      0x48, 0x83, 0x08, 0x01,                         // or qword ptr [rax], 1: the velocity passes
+      0xF3, 0xC3,                                     // rep ret
+   };
+   // clang-format on
+   constexpr size_t kVelocityGateAnchorSize = 11; // Its first instructions, with nothing masked
+   constexpr size_t kPassFlagsOffset = 0xD0;
+   constexpr uint64_t kVelocityPassesFlag = 1;
+
+   safetyhook::InlineHook g_velocity_gate_hook;
+   std::atomic<bool> g_request_velocity = false; // SR is on and has a point to run at (refreshed every present)
+
+   void HookedVelocityGate(void* plugin, uint8_t* context, void* view)
+   {
+      g_velocity_gate_hook.call<void>(plugin, context, view);
+      if (!g_request_velocity.load(std::memory_order_relaxed))
+         return;
+      if (uint64_t* const pass_flags = *reinterpret_cast<uint64_t**>(context + kPassFlagsOffset))
+         *pass_flags |= kVelocityPassesFlag; // PreExec's own write, on the same recording thread
+   }
+
+   // Counts the matches of "kVelocityGateCode" in one section and keeps the last one. A page that can't be read ends the scan.
+   bool ScanForVelocityGate(const uint8_t* begin, const uint8_t* end, const std::boyer_moore_horspool_searcher<const uint8_t*>& searcher, const uint8_t*& found, uint32_t& matches)
+   {
+      __try
+      {
+         for (const uint8_t* it = std::search(begin, end, searcher); it != end; it = std::search(it + 1, end, searcher))
+         {
+            if (size_t(end - it) < std::size(kVelocityGateCode))
+               break;
+            bool match = true;
+            for (size_t k = kVelocityGateAnchorSize; k < std::size(kVelocityGateCode) && match; k++)
+               match = kVelocityGateCode[k] < 0 || it[k] == uint8_t(kVelocityGateCode[k]);
+            if (match)
+            {
+               found = it;
+               matches++;
+            }
+         }
+         return true;
+      }
+      __except (EXCEPTION_EXECUTE_HANDLER)
+      {
+         return false;
+      }
+   }
+
+   // The single match of "kVelocityGateCode" in the game's executable sections, or null
+   const uint8_t* FindVelocityGate()
+   {
+      const auto* base = reinterpret_cast<const uint8_t*>(GetModuleHandleW(nullptr));
+      const auto* nt_headers = reinterpret_cast<const IMAGE_NT_HEADERS*>(base + reinterpret_cast<const IMAGE_DOS_HEADER*>(base)->e_lfanew);
+      const IMAGE_SECTION_HEADER* section = IMAGE_FIRST_SECTION(nt_headers);
+      uint8_t anchor[kVelocityGateAnchorSize];
+      for (size_t i = 0; i < kVelocityGateAnchorSize; i++)
+         anchor[i] = uint8_t(kVelocityGateCode[i]);
+      const std::boyer_moore_horspool_searcher<const uint8_t*> searcher(std::cbegin(anchor), std::cend(anchor));
+      const uint8_t* found = nullptr;
+      uint32_t matches = 0;
+      for (WORD i = 0; i < nt_headers->FileHeader.NumberOfSections; i++, section++)
+      {
+         constexpr DWORD kReadableCode = IMAGE_SCN_MEM_EXECUTE | IMAGE_SCN_MEM_READ;
+         if ((section->Characteristics & kReadableCode) != kReadableCode)
+            continue;
+         const uint8_t* const begin = base + section->VirtualAddress;
+         if (!ScanForVelocityGate(begin, begin + section->Misc.VirtualSize, searcher, found, matches))
+            return nullptr;
+      }
+      return matches == 1 ? found : nullptr;
+   }
+
+   // At device creation, before the game records its first frame
+   void InstallVelocityGateHook()
+   {
+      if (g_velocity_gate_hook)
+         return;
+      const auto scan_start = std::chrono::steady_clock::now();
+      const uint8_t* const gate = FindVelocityGate();
+      const double scan_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - scan_start).count();
+      if (!gate)
+      {
+         reshade::log::message(reshade::log::level::warning, "MGSV: the motion blur plugin's velocity request wasn't found (another game build?), so SR needs Motion Blur on and Post-Processing High or higher");
+         return;
+      }
+      auto hook = safetyhook::InlineHook::create(const_cast<uint8_t*>(gate), reinterpret_cast<void*>(&HookedVelocityGate));
+      if (!hook)
+      {
+         reshade::log::message(reshade::log::level::warning, "MGSV: couldn't hook the motion blur plugin's velocity request, so SR needs Motion Blur on and Post-Processing High or higher");
+         return;
+      }
+      g_velocity_gate_hook = std::move(*hook);
+      reshade::log::message(reshade::log::level::info, std::format("MGSV: SR asks for the game's velocity passes itself (motion blur plugin at exe + 0x{:X}, found in {:.1f} ms)", gate - reinterpret_cast<const uint8_t*>(GetModuleHandleW(nullptr)), scan_ms).c_str());
+   }
 #endif
 
 #if ENABLE_SR
@@ -179,8 +306,12 @@ namespace
       return device_data.sr_type != SR::Type::None && !device_data.sr_suppressed;
    }
 
-   // Without the velocity pass (Motion Blur off or Post-Processing Low) there are no motion vectors, so SR and its jitter stay off
+   // Without the velocity pass there are no motion vectors, so SR and its jitter stay off
    std::atomic<uint32_t> g_presents_since_velocity = UINT32_MAX / 2;
+   // Without the bloom reduction and FXAA (Post-Processing Off) SR has no point to run at, and its jitter alone would shake the image
+   std::atomic<uint32_t> g_presents_since_sr_point = UINT32_MAX / 2;
+   // Both of the above, worked out once per present, so the per map and per draw checks read a single flag
+   std::atomic<bool> g_sr_inputs_present = false;
    // Safety net: if a split command list ever goes unexecuted (its first half would be lost), or SR keeps failing or not taking FXAA's place,
    // SR and its jitter stop for the session and FXAA comes back
    std::atomic<bool> g_sr_disabled = false;
@@ -189,7 +320,7 @@ namespace
    std::atomic<bool> g_fxaa_over_jitter = false;
    bool SrUsable(const DeviceData& device_data)
    {
-      return SrActive(device_data) && !g_sr_disabled && g_presents_since_velocity < 2;
+      return SrActive(device_data) && !g_sr_disabled && g_sr_inputs_present.load(std::memory_order_relaxed);
    }
 
    void DisableSR(const char* reason)
@@ -1042,6 +1173,7 @@ public:
    {
 #if ENABLE_SAFETYHOOK
       InstallDeviceCheckFix();
+      InstallVelocityGateHook();
 #endif
       device_data.game = new GameDeviceDataMetalGearSolidV;
 #if ENABLE_SR
@@ -1111,6 +1243,9 @@ public:
 #endif
       if (original_shader_hashes.Contains(kFXAAHash, reshade::api::shader_stage::pixel))
       {
+#if ENABLE_SR
+         g_presents_since_sr_point.store(0, std::memory_order_relaxed);
+#endif
 #if DEVELOPMENT || TEST
          g_fxaa_draws++;
          LogNewFXAATarget(native_device_context);
@@ -1190,6 +1325,7 @@ public:
       else if (original_shader_hashes.Contains(kBloomReductionHash, reshade::api::shader_stage::pixel))
       {
 #if ENABLE_SR
+         g_presents_since_sr_point.store(0, std::memory_order_relaxed);
          // The SR point (see "kBloomReductionHash"). The reduction draws twice a frame: the first one splits.
          if (t_decoded_motion_vectors && t_bloom_split == BloomSplit::None && SrUsable(device_data))
          {
@@ -1217,6 +1353,12 @@ public:
          }
 #endif
       }
+#if DEVELOPMENT || TEST
+      else if (original_shader_hashes.Contains(kMotionBlurHash, reshade::api::shader_stage::pixel))
+      {
+         g_motion_blur_draws++;
+      }
+#endif
       return DrawOrDispatchOverrideType::None;
    }
 
@@ -1257,6 +1399,14 @@ public:
       }
       if (g_presents_since_velocity < UINT32_MAX / 2)
          g_presents_since_velocity++;
+      if (g_presents_since_sr_point < UINT32_MAX / 2)
+         g_presents_since_sr_point++;
+      const bool sr_point = g_presents_since_sr_point < 2;
+      g_sr_inputs_present.store(g_presents_since_velocity < 2 && sr_point, std::memory_order_relaxed);
+#if ENABLE_SAFETYHOOK
+      // Players on FXAA, or without an SR point (Post-Processing Off), keep the game's own behaviour and cost
+      g_request_velocity = SrActive(device_data) && sr_point;
+#endif
       const uint32_t presents = ++g_presents;
       // Split command lists the game never finished or executed (they hold references to the game's resources)
       {
@@ -1277,13 +1427,15 @@ public:
 #if DEVELOPMENT || TEST
       const uint32_t fxaa_draws = g_fxaa_draws.exchange(0);
       const uint32_t velocity_draws = g_velocity_draws.exchange(0);
-      if ((fxaa_draws != g_fxaa_draws_last_frame || velocity_draws != g_velocity_draws_last_frame) && g_logged_count_changes < kMaxLoggedCountChanges)
+      const uint32_t motion_blur_draws = g_motion_blur_draws.exchange(0);
+      if ((fxaa_draws != g_fxaa_draws_last_frame || velocity_draws != g_velocity_draws_last_frame || motion_blur_draws != g_motion_blur_draws_last_frame) && g_logged_count_changes < kMaxLoggedCountChanges)
       {
          g_logged_count_changes++;
-         reshade::log::message(reshade::log::level::info, std::format("MGSV: per frame draws changed: FXAA {} -> {}, velocity {} -> {}", g_fxaa_draws_last_frame, fxaa_draws, g_velocity_draws_last_frame, velocity_draws).c_str());
+         reshade::log::message(reshade::log::level::info, std::format("MGSV: per frame draws changed: FXAA {} -> {}, velocity {} -> {}, motion blur {} -> {}", g_fxaa_draws_last_frame, fxaa_draws, g_velocity_draws_last_frame, velocity_draws, g_motion_blur_draws_last_frame, motion_blur_draws).c_str());
       }
       g_fxaa_draws_last_frame = fxaa_draws;
       g_velocity_draws_last_frame = velocity_draws;
+      g_motion_blur_draws_last_frame = motion_blur_draws;
 #endif
    }
 
@@ -1292,10 +1444,13 @@ public:
    {
       ImGui::Text("FXAA draws (last frame): %u", g_fxaa_draws_last_frame);
       ImGui::Text("Velocity draws (last frame): %u", g_velocity_draws_last_frame);
-      if (g_fxaa_draws_last_frame != 0 && g_velocity_draws_last_frame == 0)
-      {
-         ImGui::TextUnformatted("No velocity: SR needs Motion Blur on and Post-Processing High or higher");
-      }
+      ImGui::Text("Motion blur draws (last frame): %u", g_motion_blur_draws_last_frame);
+#if ENABLE_SR
+      if (g_presents_since_sr_point >= 2)
+         ImGui::TextUnformatted("No SR point: SR needs Post-Processing Low or higher");
+      else if (g_presents_since_velocity >= 2)
+         ImGui::TextUnformatted("No velocity pass: SR is off");
+#endif
 #if DEVELOPMENT
       ImGui::Text("Scene cbuffer uploads (last frame): %u, jittered: %u, new frames: %u, invalid frame keys: %u", g_scene_cb_uploads_last_frame, g_jittered_uploads_last_frame, g_new_frames_last_frame, g_invalid_frame_keys_last_frame);
 #endif
@@ -1345,6 +1500,7 @@ public:
                   "\nPetarBadzhakov"
                   "\n\nAcknowledgments:"
                   "\nghostinthecamera (why the game closes under ReShade)"
+                  "\nPhantomFX (the motion blur plugin gates the velocity passes)"
                   "\n\nThird Party:"
                   "\nReShade"
                   "\nImGui"
