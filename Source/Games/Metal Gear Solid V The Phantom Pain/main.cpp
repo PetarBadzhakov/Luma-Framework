@@ -1,13 +1,21 @@
-// Metal Gear Solid V: The Phantom Pain — Luma mod (Fox Engine, D3D11).
-// Replaces the game's FXAA with native resolution super resolution (FSR 3, FSR 4 through DX12 interop, DLSS).
-// The game has no TAA, so Luma injects the jitter (into the game's camera constants as they're uploaded) and builds full precision
-// motion vectors (a compute pass next to the game's own 8 bit ones). The game records its post processing on deferred contexts, so SR
-// splits the post processing command list right before the game's bloom and runs on the immediate context between its two halves (like
-// Persona 5 Royal at FXAA): bloom, lens flare, DoF, motion blur, the LUT and the tonemap run on its output, and FXAA is skipped.
-// The game quits at startup if its D3D11 device context is wrapped. Luma hooks the real one in place, so that check passes on its own
-// (Test and Development builds log it, see "LogWrapperCheck()").
-// The game only draws its velocity passes with Motion Blur on and Post-Processing High or higher, so while SR runs Luma asks for them
-// itself ("InstallVelocityGateHook()").
+// Metal Gear Solid V: The Phantom Pain — Luma mod (Fox Engine, D3D11): native resolution SR (FSR 3, FSR 4 through DX12 interop, DLSS) in
+// place of the game's FXAA. Each part below falls back to the game's own FXAA when it can't run.
+// - Jitter: the game has no TAA, so the jitter goes into its camera constants as they're uploaded ("OnUnmapSceneCB()").
+// - Motion vectors: a compute pass recorded next to the game's velocity pass rebuilds them in full precision ("DecodeMotionVectors()").
+// - SR's slot: the game records its post processing on deferred contexts, so SR splits that command list right before bloom and runs on
+//   the immediate context between its two halves ("SplitBeforeBloom()", "OnSRCommandList()"). Bloom, DoF, motion blur and the tonemap
+//   then run on its output, and FXAA is skipped. A frame that can't split there runs SR at FXAA's slot instead ("SplitForSR()").
+// - Startup: the game quits if its D3D11 device context is wrapped. Luma hooks the real one in place, so that check passes on its own
+//   (Test and Development builds log it, see "LogWrapperCheck()").
+// - Velocity: the game only draws its velocity passes with Motion Blur on and Post-Processing High or higher, so while SR runs the mod
+//   asks for them itself ("InstallVelocityGateHook()"). SR needs Post-Processing Low or higher.
+// Assumptions about the engine (measured):
+// - A frame's velocity pass, post processing list and FXAA are recorded on the same thread. If not, SR runs at FXAA's slot, or that frame
+//   keeps FXAA.
+// - A frame's command lists execute before the next frame's, so the one set of motion vector and depth textures isn't rewritten before SR
+//   reads it.
+// - The camera constants are the only 480 byte constant buffer that matters; the other views of that size are told apart by their
+//   projection ("IsMainView()").
 // Development builds can also skip FXAA, jitter without SR and flip the SR inputs (MCP "luma_dev_values" or the dev settings).
 
 #define GAME_METAL_GEAR_SOLID_V 1
@@ -113,6 +121,8 @@ namespace
 #endif
 
 #if ENABLE_SAFETYHOOK
+   // A process-wide hook, installed once and kept until the process exits. Another mod's inline hook on the same function stays in the
+   // chain (SafetyHook relocates its jump).
    // SR's motion vectors come from the game's velocity passes, which it only draws when "GrPluginMotionBlur::PreExec()" asks for them:
    // with Motion Blur on and Post-Processing High or higher. The blur itself ("Exec()") checks the same, so asking after PreExec while SR
    // runs gives SR its motion vectors and leaves the blur to the game's settings. PreExec (RVA 0x1E2D80 in 1.0.15.4) is found by its first
@@ -254,6 +264,7 @@ namespace
    bool g_flip_jitter_y = false;
 #endif
 
+   // SR state: what the per map and per draw checks read
    bool SrActive(const DeviceData& device_data)
    {
       return device_data.sr_type != SR::Type::None && !device_data.sr_suppressed;
@@ -267,8 +278,8 @@ namespace
    // and it also has its inputs ("g_sr_usable")
    std::atomic<bool> g_sr_selected = false;
    std::atomic<bool> g_sr_usable = false;
-   // Safety net: if a split command list ever goes unexecuted (its first half would be lost), or SR keeps failing or not taking FXAA's place,
-   // SR and its jitter stop for the session and FXAA comes back
+   // Safety net: if split command lists keep going unexecuted, or SR keeps failing or not taking FXAA's place, SR and its jitter stop until
+   // another Super Resolution type is picked, and FXAA comes back
    std::atomic<bool> g_sr_disabled = false;
    std::atomic<uint32_t> g_sr_failures_in_a_row = 0;
    // FXAA drew over a jittered scene (SR didn't take its place), so that frame shakes. Counted at present, like an SR failure.
@@ -297,7 +308,7 @@ namespace
 
    // The velocity pass's camera of the frame being recorded on this thread, without our jitter: its upload comes right before its draw,
    // where the motion vector decode rebuilds camera motion from it. It also carries the frame's jitter for SR: the game records the
-   // velocity pass and FXAA of a frame on the same thread (measured in every frame of a long capture).
+   // velocity pass and FXAA of a frame on the same thread (measured).
    struct VelocityCamera
    {
       CB::LumaGameData data = {};
@@ -321,22 +332,13 @@ namespace
    };
    thread_local BloomSplit t_bloom_split = BloomSplit::None;
 
-#if DEVELOPMENT
-   // Diagnostics per FXAA interval (FXAA is the game's last pass before the UI)
-   std::atomic<uint32_t> g_scene_cb_uploads = 0;
-   std::atomic<uint32_t> g_jittered_uploads = 0;
-   std::atomic<uint32_t> g_new_frames = 0;
-   std::atomic<uint32_t> g_invalid_frame_keys = 0;
-   uint32_t g_scene_cb_uploads_last_frame = 0;
-   uint32_t g_jittered_uploads_last_frame = 0;
-   uint32_t g_new_frames_last_frame = 0;
-   uint32_t g_invalid_frame_keys_last_frame = 0;
-#endif
-
    // The aspect ratio of the camera the velocity pass uses (the only upload with the previous view projection), i.e. the main camera,
-   // whatever the resolution, aspect ratio or pillarboxing. Until it's seen, the output's aspect ratio stands in.
+   // whatever the resolution, aspect ratio or pillarboxing. Until it's seen, the output's aspect ratio stands in. Another camera that
+   // uploaded the previous view projection too would take its place.
    std::atomic<float> g_main_aspect_ratio = 0.f;
 
+   // Frame identity: the jitter phase. Every main view upload of a frame gets that frame's phase, and consecutive frames get consecutive
+   // phases; a misfire of the still camera rule below repeats or skips one phase.
    // The jitter phase of each frame, keyed by the frame's camera state. The game records its frames on worker threads, and the passes of
    // a frame in no fixed order (some of them after its FXAA, sometimes the next frame's before it), so no record time event (present,
    // FXAA draw) is a reliable frame boundary. All the main view uploads of a frame carry the same camera state instead: the depth row of
@@ -375,31 +377,8 @@ namespace
    uint32_t g_last_upload_present = UINT32_MAX; // "g_presents" at the last main view upload
    std::chrono::steady_clock::time_point g_last_upload_time;
 
-#if DEVELOPMENT
-   std::atomic<uint32_t> g_latest_frame = 0;
-
-   // Logs the first new camera keys after the jitter is turned on
-   uint32_t g_logged_keys = 0;
-   constexpr uint32_t kMaxLoggedKeys = 32;
-
-   // Which frame's phase SR gets at the FXAA draw, which uploads no camera: the last main view upload recorded on the FXAA's own thread
-   // (the velocity pass's, see "VelocityCamera"). Counts since the jitter was last turned on.
-   std::atomic<uint32_t> g_last_velocity_frame = UINT32_MAX;
-   std::atomic<uint32_t> g_last_velocity_phase = UINT32_MAX;
-   thread_local uint32_t t_last_main_frame = UINT32_MAX;
-   thread_local bool t_main_upload_since_fxaa = false;
-   uint32_t g_fxaa_records = 0;
-   uint32_t g_fxaa_thread_had_main = 0;
-   uint32_t g_fxaa_thread_matches_velocity = 0;
-   uint32_t g_fxaa_velocity_is_latest = 0;
-   // How the velocity pass phase moved since the previous FXAA draw: by one (expected), not at all (a perfectly still camera), or else
-   uint32_t g_fxaa_phase_steps = 0;
-   uint32_t g_fxaa_phase_repeats = 0;
-   uint32_t g_fxaa_phase_skips = 0;
-#endif
-
-   // Frames with an identical camera state share an index and phase, until a still camera's next frame (see "g_generation")
-   uint32_t GetFrameIndex(const SceneRows& rows, bool velocity_upload, uint32_t& phase)
+   // Frames with an identical camera state share a phase, until a still camera's next frame (see "g_generation")
+   uint32_t GetJitterPhase(const SceneRows& rows, bool velocity_upload)
    {
       FrameKey key;
       std::memcpy(key.rows[0], rows[kRowProjectionView + 3], sizeof(key.rows[0]));
@@ -437,25 +416,13 @@ namespace
          frame_phase = &g_frame_phases[frame % g_frame_phases.size()];
          *frame_phase = {key, frame, g_main_frames % SR::GetDefaultJitterPhases(), false, true};
          frame_phase->generation = g_generation;
-#if DEVELOPMENT
-         g_latest_frame = frame;
-         g_new_frames++;
-         if (g_logged_keys < kMaxLoggedKeys)
-         {
-            g_logged_keys++;
-            const float (&eye)[4] = rows[kRowEyePos];
-            const float (&forward)[4] = rows[kRowProjectionView + 3];
-            Luma::Utils::Log::Info("MGSV: camera key {} (main frame {}, phase {}): velocity upload {}, eye ({:.4f} {:.4f} {:.4f}), forward ({:.5f} {:.5f} {:.5f} {:.4f}), projection scale ({:.4f} {:.4f})", frame, g_main_frames, frame_phase->phase, velocity_upload, eye[0], eye[1], eye[2], forward[0], forward[1], forward[2], forward[3], rows[kRowProjection][0], rows[kRowProjection + 1][1]);
-         }
-#endif
       }
       if (velocity_upload && !frame_phase->counted)
       {
          frame_phase->counted = true;
          g_main_frames++;
       }
-      phase = frame_phase->phase;
-      return frame_phase->frame;
+      return frame_phase->phase;
    }
 
    // The scene cbuffer this thread mapped (each deferred context is recorded by one thread at a time)
@@ -474,12 +441,6 @@ namespace
       bool restored = false; // The game's rows are back in the buffer
    };
    thread_local JitteredUpload t_last_jittered_upload;
-
-#if DEVELOPMENT
-   // Outlier logger: every kind of view the game uploads scene constants for (main, shadow, reflection...)
-   std::mutex g_view_signatures_mutex;
-   std::set<std::tuple<bool, int, bool>> g_view_signatures;
-#endif
 
    // The depth (w) row of a view projection is the camera's unit forward axis (plus its distance term)
    bool IsViewProjectionWRow(const float (&row)[4], const float (&current_w_row)[4])
@@ -503,18 +464,6 @@ namespace
       }
       const float main_aspect_ratio = g_main_aspect_ratio > 0.f ? g_main_aspect_ratio.load() : (output_size.x / output_size.y);
       const bool main_view = perspective && std::abs(aspect_ratio - main_aspect_ratio) < main_aspect_ratio * 0.005f;
-
-#if DEVELOPMENT
-      const auto signature = std::make_tuple(perspective, int(std::round(aspect_ratio * 100.f)), prev_projection_view);
-      {
-         const std::lock_guard lock(g_view_signatures_mutex);
-         if (g_view_signatures.size() < 64 && g_view_signatures.insert(signature).second)
-         {
-            Luma::Utils::Log::Info("MGSV: new scene view: perspective {}, aspect ratio {:.3f}, vertical scale {:.3f}, previous view projection in rows 8-11 {}, main view {}", perspective, aspect_ratio, rows[kRowProjection + 1][1], prev_projection_view, main_view);
-         }
-      }
-#endif
-
       return main_view;
    }
 
@@ -563,9 +512,6 @@ namespace
    // The unmap of a scene cbuffer this thread mapped, before the real one, so the mapped memory still takes our changes
    void OnUnmapSceneCB(const DeviceData& device_data, ID3D11Buffer* buffer, void* data)
    {
-#if DEVELOPMENT
-      g_scene_cb_uploads++;
-#endif
       // A new upload replaces the rows that buffer held (they're kept again below if we jitter them)
       if (t_last_jittered_upload.buffer == buffer)
          t_last_jittered_upload.buffer = nullptr;
@@ -614,26 +560,8 @@ namespace
       if (!jitter)
          return;
 
-#if DEVELOPMENT
-      // A frame key without a valid camera axis could split a frame's passes into different phases
-      if (!IsViewProjectionWRow(rows[kRowProjectionView + 3], rows[kRowProjectionView + 3]))
-      {
-         g_invalid_frame_keys++;
-      }
-#endif
-
       // Halton(2, 3) in pixels of the game's render viewport, as an NDC offset (NDC y goes up, pixels go down)
-      uint32_t phase = 0;
-      const uint32_t frame = GetFrameIndex(rows, prev_projection_view, phase);
-#if DEVELOPMENT
-      t_last_main_frame = frame;
-      t_main_upload_since_fxaa = true;
-      if (prev_projection_view)
-      {
-         g_last_velocity_frame = frame;
-         g_last_velocity_phase = phase;
-      }
-#endif
+      const uint32_t phase = GetJitterPhase(rows, prev_projection_view);
       const float jitter_x = SR::HaltonSequence(phase, 2);
       const float jitter_y = SR::HaltonSequence(phase, 3);
       const float render_width = rows[kRowViewportSize][0] > 0.f ? rows[kRowViewportSize][0] : device_data.output_resolution.x;
@@ -646,9 +574,6 @@ namespace
       last_upload.restored = false;
       JitterView(rows, prev_projection_view, offset_x, offset_y);
       std::memcpy(data, rows, sizeof(rows));
-#if DEVELOPMENT
-      g_jittered_uploads++;
-#endif
       if (prev_projection_view)
       {
          t_velocity_camera.data.CameraCenterOffset.x += offset_x;
@@ -998,11 +923,17 @@ class MetalGearSolidV final : public Game
             copy_ps = ps->second;
       }
       auto* sr_instance_data = device_data.GetSRInstanceData();
-      const char* const missing = (!input || !output) ? "no SR input or output texture" : !exposure             ? "no exposure texture"
-                                                                                       : !output_blend_state    ? "no blend state"
-                                                                                       : (!copy_vs || !copy_ps) ? "no copy shaders"
-                                                                                       : !sr_instance_data      ? "no SR instance"
-                                                                                                                : nullptr;
+      const char* missing = nullptr;
+      if (!input || !output)
+         missing = "no SR input or output texture";
+      else if (!exposure)
+         missing = "no exposure texture";
+      else if (!output_blend_state)
+         missing = "no blend state";
+      else if (!copy_vs || !copy_ps)
+         missing = "no copy shaders";
+      else if (!sr_instance_data)
+         missing = "no SR instance";
       if (missing)
       {
          CountSRResult(false, missing);
@@ -1180,12 +1111,7 @@ public:
          {"sr_flip_motion_vectors_x", &g_flip_motion_vectors_x}, {"sr_flip_motion_vectors_y", &g_flip_motion_vectors_y},
          {"sr_flip_jitter_x", &g_flip_jitter_x}, {"sr_flip_jitter_y", &g_flip_jitter_y}});
       Mcp::RegisterTextures({MCP_GAME_TEXTURE("mgsv.motion_vectors", motion_vectors), MCP_GAME_TEXTURE("mgsv.depth", depth), MCP_GAME_TEXTURE("mgsv.sr_input", sr_input), MCP_GAME_TEXTURE("mgsv.sr_output", sr_output)});
-      Mcp::RegisterCounters({{"fxaa_draws", &g_fxaa_draws_last_frame}, {"velocity_draws", &g_velocity_draws_last_frame},
-         {"scene_cb_uploads", &g_scene_cb_uploads_last_frame}, {"jittered_uploads", &g_jittered_uploads_last_frame},
-         {"new_frames", &g_new_frames_last_frame}, {"invalid_frame_keys", &g_invalid_frame_keys_last_frame},
-         {"fxaa_records", &g_fxaa_records}, {"fxaa_thread_had_main", &g_fxaa_thread_had_main},
-         {"fxaa_thread_matches_velocity", &g_fxaa_thread_matches_velocity}, {"fxaa_velocity_is_latest", &g_fxaa_velocity_is_latest},
-         {"fxaa_phase_steps", &g_fxaa_phase_steps}, {"fxaa_phase_repeats", &g_fxaa_phase_repeats}, {"fxaa_phase_skips", &g_fxaa_phase_skips}});
+      Mcp::RegisterCounters({{"fxaa_draws", &g_fxaa_draws_last_frame}, {"velocity_draws", &g_velocity_draws_last_frame}, {"motion_blur_draws", &g_motion_blur_draws_last_frame}});
 #endif
    }
 
@@ -1204,53 +1130,6 @@ public:
          LogNewFXAATarget(native_device_context);
 #endif
 #if DEVELOPMENT
-         // Per FXAA interval: "new_frames" should average 1 (one new camera state per frame)
-         g_scene_cb_uploads_last_frame = g_scene_cb_uploads.exchange(0);
-         g_jittered_uploads_last_frame = g_jittered_uploads.exchange(0);
-         g_new_frames_last_frame = g_new_frames.exchange(0);
-         g_invalid_frame_keys_last_frame = g_invalid_frame_keys.exchange(0);
-
-         // The jitter diagnostics (see "g_fxaa_records"), restarted each time the jitter turns on
-         const bool jitter = g_jitter_enable || SrUsable();
-         static bool jitter_was_enabled = false;
-         static uint32_t previous_velocity_phase = UINT32_MAX;
-         if (jitter && !jitter_was_enabled)
-         {
-            g_fxaa_records = g_fxaa_thread_had_main = g_fxaa_thread_matches_velocity = g_fxaa_velocity_is_latest = 0;
-            g_fxaa_phase_steps = g_fxaa_phase_repeats = g_fxaa_phase_skips = 0;
-            previous_velocity_phase = UINT32_MAX;
-            const std::lock_guard lock(g_frame_phases_mutex);
-            g_logged_keys = 0;
-         }
-         jitter_was_enabled = jitter;
-         if (jitter)
-         {
-            const uint32_t velocity_frame = g_last_velocity_frame;
-            const uint32_t velocity_phase = g_last_velocity_phase;
-            g_fxaa_records++;
-            if (t_main_upload_since_fxaa)
-            {
-               g_fxaa_thread_had_main++;
-               if (t_last_main_frame == velocity_frame)
-                  g_fxaa_thread_matches_velocity++;
-            }
-            if (velocity_frame == g_latest_frame)
-               g_fxaa_velocity_is_latest++;
-            if (previous_velocity_phase != UINT32_MAX && velocity_phase != UINT32_MAX)
-            {
-               const uint32_t phases = SR::GetDefaultJitterPhases();
-               const uint32_t step = (velocity_phase + phases - previous_velocity_phase) % phases;
-               if (step == 1)
-                  g_fxaa_phase_steps++;
-               else if (step == 0)
-                  g_fxaa_phase_repeats++;
-               else
-                  g_fxaa_phase_skips++;
-            }
-            previous_velocity_phase = velocity_phase;
-            t_main_upload_since_fxaa = false;
-         }
-
          // The FXAA target already holds the tonemapped image (FXAA reads a copy of it), so skipping it leaves that unchanged
          if (g_skip_fxaa)
             return DrawOrDispatchOverrideType::Skip;
@@ -1417,9 +1296,6 @@ public:
          ImGui::TextUnformatted("No SR point: SR needs Post-Processing Low or higher");
       else if (g_presents_since_velocity >= 2)
          ImGui::TextUnformatted("No velocity pass: SR is off");
-#endif
-#if DEVELOPMENT
-      ImGui::Text("Scene cbuffer uploads (last frame): %u, jittered: %u, new frames: %u, invalid frame keys: %u", g_scene_cb_uploads_last_frame, g_jittered_uploads_last_frame, g_new_frames_last_frame, g_invalid_frame_keys_last_frame);
 #endif
    }
 #endif
